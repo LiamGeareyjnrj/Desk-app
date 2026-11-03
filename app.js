@@ -7,10 +7,22 @@
   const TZ = "Europe/London";
   const POLL = 15, STALE = 900;
 
-  // ---- data path: #d=... once, then localStorage ----
+  // ---- data path: #d= or ?d= (kept in the URL so Add to Home Screen keeps it), then localStorage ----
   (function () {
-    const m = location.hash.match(/[#&]d=([^&]+)/);
-    if (m) { localStorage.setItem("desk.dp", decodeURIComponent(m[1])); history.replaceState(null, "", location.pathname + location.search + "#/"); }
+    const m = location.hash.match(/[#&]d=([^&]+)/) || location.search.match(/[?&]d=([^&]+)/);
+    if (m) localStorage.setItem("desk.dp", decodeURIComponent(m[1]));
+    const dp = localStorage.getItem("desk.dp");
+    if (!dp) return;
+    const q = "?d=" + encodeURIComponent(dp);
+    if (location.search !== q || /[#&]d=/.test(location.hash)) history.replaceState(null, "", location.pathname + q + (/[#&]d=/.test(location.hash) ? "#/" : (location.hash || "#/")));
+    try {
+      const base = location.origin + location.pathname.replace(/[^/]*$/, "");
+      const man = { name: "Desk", short_name: "Desk", start_url: base + q + "#/", scope: base, display: "standalone", orientation: "portrait",
+        background_color: "#000000", theme_color: "#000000",
+        icons: [{ src: base + "icons/icon-192.png", sizes: "192x192", type: "image/png" }, { src: base + "icons/icon-512.png", sizes: "512x512", type: "image/png" }] };
+      const l = document.querySelector('link[rel="manifest"]');
+      if (l) l.href = URL.createObjectURL(new Blob([JSON.stringify(man)], { type: "application/manifest+json" }));
+    } catch (e) {}
   })();
   const DP = localStorage.getItem("desk.dp");
   const base = () => "d/" + encodeURIComponent(DP) + "/";
@@ -375,7 +387,9 @@
     const r = route(), v = $("#view");
     document.querySelectorAll(".tabbar a").forEach(a => a.classList.toggle("on", a.dataset.tab === (["coin", "auditor"].includes(r.name) ? "" : r.name)));
     banner();
-    if (!DP) { v.innerHTML = `<div class="navbar"><span class="title">Desk</span></div><div class="empty">Open the desk link from Telegram once (it ends in #d=…). It is kept on this phone after that.</div>`; return; }
+    if (!DP) { v.innerHTML = `<div class="navbar"><span class="title">Desk</span></div><div class="empty">Open the desk link from Telegram in Safari, then Share and Add to Home Screen. Or paste the desk link here:<br><br><input id="dpin" type="url" placeholder="Paste desk link" style="width:90%;padding:10px;font-size:16px;border-radius:10px;border:1px solid #333;background:#111;color:#fff"><br><br><button id="dpgo" style="padding:10px 18px;font-size:16px;border-radius:10px">Open desk</button></div>`;
+      const go = $("#dpgo"); if (go) go.onclick = () => { const m = ($("#dpin").value || "").match(/[#?&]d=([^&#]+)/); if (m) { localStorage.setItem("desk.dp", decodeURIComponent(m[1])); location.replace(location.pathname + "?d=" + m[1] + "#/"); } };
+      return; }
     if (!S.state) { v.innerHTML = skeleton(r.name); return; }
     const car = $("#car"), sl = car ? car.scrollLeft : 0, y = window.scrollY;
     const scr = r.name === "home" ? home() : r.name === "agents" ? agents(r.q) : r.name === "activity" ? activity()
