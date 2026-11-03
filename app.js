@@ -26,6 +26,12 @@
     const d = Math.min(14, Math.max(2, 3 - Math.floor(Math.log10(v))));
     return "$" + v.toFixed(d);
   };
+  // big header price: tiny prices as $0.0₈2634 (subscript = number of zeros after the point), like DexScreener
+  const bigPrice = v => {
+    const s = price(v), m = /^\$0\.(0{4,})(\d+)$/.exec(s);
+    return m ? { html: `$0.0<sub>${m[1].length}</sub>${m[2].slice(0, 4)}`, n: 5 + String(m[1].length).length + 2 }
+             : { html: s, n: s.length };
+  };
   const pct = (v, d = 2) => v == null ? "n/a" : (v >= 0 ? "+" : "") + v.toFixed(d) + "%";
   const hm = ts => new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", minute: "2-digit" }).format(new Date(ts * 1000));
   const age = ts => { if (!ts) return ""; const m = Math.max(0, (Date.now() / 1000 - ts) / 60); return m < 60 ? Math.round(m) + "m old" : m < 2880 ? Math.round(m / 60) + "h old" : Math.round(m / 1440) + "d old"; };
@@ -323,7 +329,7 @@
     const html = backbar(c.symbol || "", paperPill(S.state) || '<span style="width:44px"></span>') + `
       <div class="coin-head"><h1>${esc(c.name || c.mint.slice(0, 6))} ${shield}</h1>
         <div class="sec">${esc(c.symbol || "")} · ${esc(c.chain)} · ${age(c.migrated_at)}</div></div>
-      <div class="price ${c.price != null && c.price < 0.001 ? "small" : ""}">${price(c.price)}</div>${since}${statusLine}
+      <div class="price" style="--n:${bigPrice(c.price).n}">${bigPrice(c.price).html}</div>${since}${statusLine}
       <div class="chart-wrap"><span id="cv-slot"></span>${(c.candles || []).length ? "" : '<div class="chart-empty">No price yet</div>'}</div>
       <div class="stats"><div><b>${usdK(st.market_cap)}</b><span>Market cap</span></div><div><b>${usdK(st.liquidity)}</b><span>Liquidity</span></div>
         <div><b>${usdK(st.volume_24h)}</b><span>24h volume</span></div><div><b>${st.holders == null ? "n/a" : st.holders.toLocaleString("en-US")}</b><span>Holders</span></div></div>

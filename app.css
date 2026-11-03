@@ -136,7 +136,8 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:poin
 .chip{display:inline-flex;align-items:center;gap:4px;height:26px;padding:0 10px;border-radius:13px;background:rgba(0,211,90,.16);color:var(--green);font:600 13px var(--textf)}
 .chip.no{background:rgba(255,69,58,.18);color:var(--red)}
 .price{font:600 66px/1.05 var(--display);letter-spacing:-1.5px;padding:8px var(--g) 0;font-variant-numeric:tabular-nums}
-.price.small{font-size:48px}
+.price{font-size:min(66px, calc((100vw - 32px) / (var(--n, 8) * 0.62)))}
+.price sub{font-size:.42em;vertical-align:-.05em;letter-spacing:0}
 .stats{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--sep);margin:16px var(--g);border-radius:12px;overflow:hidden}
 .stats div{background:var(--card);padding:12px 14px}
 .stats b{display:block;font:600 17px var(--textf)}
