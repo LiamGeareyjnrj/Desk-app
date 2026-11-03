@@ -1,0 +1,15 @@
+# Only the web app and published JSON live here. Never code, db, logs or secrets.
+*.py
+*.db
+*.db-*
+*.sqlite*
+*.log
+logs/
+.env
+.env.*
+*.pem
+*.key
+.desk_secrets/
+__pycache__/
+.venv/
+*.tmp
