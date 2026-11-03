@@ -1,182 +1,405 @@
-// Desk web app (plan B): polls static JSON at d/{DATA_PATH}/ published by the desk every ~2 min.
-// FOMO links come ready-made in the JSON (built by links.py); this file never builds a FOMO URL.
+/* Desk app. Plan B: reads JSON from d/{DATA_PATH}/ only. FOMO links come from the JSON verbatim (links.py). */
 (function () {
   "use strict";
-  const POLL_MS = 60000;
-  const $ = (s) => document.querySelector(s);
-  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-  const params = () => Object.fromEntries(location.hash.replace(/^#/, "").split("&").filter(Boolean).map((p) => p.split("=").map(decodeURIComponent)));
-  let D = { state: null, activity: [], coins: [], positions: [] }, lastOk = 0, lastErr = null, tab = "home";
+  const RM = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const $ = s => document.querySelector(s);
+  const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const TZ = "Europe/London";
+  const POLL = 15, STALE = 900;
 
-  function dataPath() {
-    const p = params();
-    if (p.d) { try { localStorage.setItem("desk.d", p.d); } catch (e) {} return p.d; }
-    try { return localStorage.getItem("desk.d"); } catch (e) { return null; }
+  // ---- data path: #d=... once, then localStorage ----
+  (function () {
+    const m = location.hash.match(/[#&]d=([^&]+)/);
+    if (m) { localStorage.setItem("desk.dp", decodeURIComponent(m[1])); history.replaceState(null, "", location.pathname + location.search + "#/"); }
+  })();
+  const DP = localStorage.getItem("desk.dp");
+  const base = () => "d/" + encodeURIComponent(DP) + "/";
+
+  const S = { state: null, chart: null, act: null, coins: {}, lastOk: 0, failing: false, nextTry: 0, range: "LIVE", actShown: 30, sheet: null, q: "" };
+
+  // ---- formatting ----
+  const usd = (v, dp) => v == null ? "n/a" : (v < 0 ? "-" : "") + "$" + Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: dp == null ? 2 : dp, maximumFractionDigits: dp == null ? 2 : dp });
+  const usdK = v => v == null ? "n/a" : v >= 1e6 ? "$" + (v / 1e6).toFixed(2) + "M" : v >= 1e3 ? "$" + (v / 1e3).toFixed(1) + "K" : usd(v);
+  const price = v => {
+    if (v == null) return "n/a";
+    if (v >= 1) return usd(v, v >= 1000 ? 2 : 4);
+    const d = Math.min(14, Math.max(2, 3 - Math.floor(Math.log10(v))));
+    return "$" + v.toFixed(d);
+  };
+  const pct = (v, d = 2) => v == null ? "n/a" : (v >= 0 ? "+" : "") + v.toFixed(d) + "%";
+  const hm = ts => new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", minute: "2-digit" }).format(new Date(ts * 1000));
+  const age = ts => { if (!ts) return ""; const m = Math.max(0, (Date.now() / 1000 - ts) / 60); return m < 60 ? Math.round(m) + "m old" : m < 2880 ? Math.round(m / 60) + "h old" : Math.round(m / 1440) + "d old"; };
+  const left = ts => { const s = Math.max(0, ts - Date.now() / 1000); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60); return h ? `${h}h ${m}m` : `${m}m`; };
+  const ext = (url, text, cls) => url ? `<a class="${cls || ""}" href="${esc(url)}" target="_blank" rel="noopener">${text}</a>` : text;
+
+  // ---- fetch loop ----
+  async function get(path) {
+    const r = await fetch(base() + path + "?t=" + Date.now(), { cache: "no-store" });
+    if (!r.ok) throw new Error(r.status);
+    return r.json();
   }
-  function setHash(extra) {
-    const d = dataPath();
-    location.hash = "d=" + encodeURIComponent(d || "") + (extra ? "&" + extra : "");
-  }
-
-  const usd = (v, d = 2) => v == null ? "n/a" : (Math.abs(v) >= 1e6 ? "$" + (v / 1e6).toFixed(2) + "M" : Math.abs(v) >= 1e4 ? "$" + (v / 1e3).toFixed(0) + "k" : (v < 0 ? "-$" : "$") + Math.abs(v).toFixed(d));
-  const pct = (v) => v == null ? "n/a" : (v >= 0 ? "+" : "") + Number(v).toFixed(1) + "%";
-  const cls = (v) => v == null ? "" : v >= 0 ? "g" : "r";
-  const price = (p) => { if (p == null) return "n/a"; return p >= 1 ? "$" + p.toFixed(4) : "$" + Number(p).toPrecision(4); };
-  const ago = (t) => { if (!t) return "never"; const s = Math.max(0, Date.now() / 1000 - t); return s < 90 ? Math.round(s) + "s ago" : s < 5400 ? Math.round(s / 60) + " min ago" : s < 172800 ? Math.round(s / 3600) + " h ago" : Math.round(s / 86400) + " d ago"; };
-  const isoT = (iso) => iso ? new Date(iso).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/London" }) : "";
-  const btn = (label, url, kind) => url ? `<a class="btn sm ${kind || ""}" href="${esc(url)}" target="_blank" rel="noopener">${esc(label)}</a>` : "";
-
-  async function load() {
-    const d = dataPath();
-    if (!d) { lastErr = "nopath"; render(); return; }
-    const base = "d/" + encodeURIComponent(d) + "/";
+  async function poll() {
+    if (!DP) return render();
     try {
-      const t = Date.now();
-      const get = (f) => fetch(base + f + "?t=" + t, { cache: "no-store" }).then((r) => { if (!r.ok) throw new Error(f + " HTTP " + r.status); return r.json(); });
-      const [state, activity, coins, positions] = await Promise.all(["state.json", "activity.json", "coins.json", "positions.json"].map(get));
-      D = { state, activity, coins, positions }; lastOk = Date.now(); lastErr = null;
-    } catch (e) { lastErr = String(e.message || e); }
+      const [st, ch, ac] = await Promise.all([get("state.json"), get("chart.json"), get("activity.json")]);
+      S.state = st; S.chart = ch; S.act = ac; S.lastOk = Date.now(); S.failing = false;
+      const r = route();
+      if (r.mint) await loadCoin(r.mint, true);
+    } catch (e) { S.failing = true; }
+    S.nextTry = Date.now() + POLL * 1000;
     render();
   }
+  async function loadCoin(mint, quiet) {
+    try { S.coins[mint] = await get("coin/" + encodeURIComponent(mint) + ".json"); S.coins[mint]._ok = true; }
+    catch (e) { if (!S.coins[mint]) S.coins[mint] = { _missing: true }; if (!quiet) S.failing = !S.state; }
+  }
+  setInterval(poll, POLL * 1000);
+  setInterval(banner, 1000);
 
+  const OFF = $("#offline");   // one red row, kept right under the current navbar
   function banner() {
-    const b = $("#banner");
-    let msg = "", warn = false;
-    if (lastErr && lastErr !== "nopath") msg = D.state ? `Can't reach desk data (${esc(lastErr)}). Showing data from ${ago(D.state.generated_at)}.` : `Can't reach desk data (${esc(lastErr)}). Retrying every minute.`;
-    else if (D.state && Date.now() / 1000 - D.state.generated_at > 900) { msg = `Desk data is ${ago(D.state.generated_at)}. The desk may be down; pushes come via Telegram.`; warn = true; }
-    b.className = "banner" + (warn ? " warn" : "") + (msg ? "" : " hidden");
-    b.innerHTML = msg;
+    const el = OFF;
+    const nb = document.querySelector("#view .navbar");
+    if (nb && nb.nextElementSibling !== el) nb.after(el);
+    const stale = S.state && (Date.now() / 1000 - S.state.generated_at > STALE);
+    if (!(S.failing || stale)) { el.hidden = true; return; }
+    const n = Math.max(0, Math.ceil((S.nextTry - Date.now()) / 1000));
+    const last = S.state ? hm(S.state.generated_at) : "never";
+    el.textContent = `Desk offline · retrying in ${n}s · last update ${last}`;
+    el.hidden = false;
+  }
+  new MutationObserver(() => { if (!OFF.hidden) banner(); }).observe($("#view"), { childList: true });
+
+  // ---- router ----
+  function route() {
+    const h = location.hash.replace(/^#\/?/, "");
+    const [a, b] = h.split("/");
+    if (a === "coin" || a === "auditor") return { name: a, mint: decodeURIComponent(b || "") };
+    const [n, q] = (a || "").split("?");
+    return { name: n || "home", q: new URLSearchParams(q || "") };
+  }
+  window.addEventListener("hashchange", async () => {
+    S.sheet = null; window.scrollTo(0, 0);
+    const r = route();
+    render();
+    if (r.mint && !S.coins[r.mint]) { await loadCoin(r.mint); render(); }
+  });
+
+  // ---- odometer ----
+  const odo = document.createElement("div"); odo.className = "odo num"; odo._v = null;
+  function setOdo(text) {
+    if (odo._v === text) return;
+    const old = odo._v; odo._v = text;
+    const animate = old != null && old.length === text.length && !RM();
+    if (!animate) {
+      odo.innerHTML = [...text].map(ch => /\d/.test(ch)
+        ? `<span class="d"><span class="strip" style="transform:translateY(-${ch}0%)">${[..."0123456789"].map(x => `<span>${x}</span>`).join("")}</span></span>`
+        : `<span class="s">${esc(ch)}</span>`).join("");
+      return;
+    }
+    const kids = [...odo.children], n = text.length;
+    let fromRight = 0;
+    for (let i = n - 1; i >= 0; i--, fromRight++) {
+      const ch = text[i], k = kids[i];
+      if (/\d/.test(ch) && k.classList.contains("d")) {
+        const s = k.firstChild;
+        if (old[i] !== ch) { s.style.transitionDelay = (fromRight * 30) + "ms"; s.style.transform = `translateY(-${ch}0%)`; }
+      } else if (!/\d/.test(ch)) k.textContent = ch;
+    }
   }
 
-  function chart(canvas, pts, opts = {}) {
-    const dpr = window.devicePixelRatio || 1, w = canvas.clientWidth, h = opts.h || 120;
-    canvas.width = w * dpr; canvas.height = h * dpr; canvas.style.height = h + "px";
-    const c = canvas.getContext("2d"); c.scale(dpr, dpr);
-    if (!pts || pts.length < 2) { c.fillStyle = "#8b93a7"; c.font = "12px system-ui"; c.textAlign = "center"; c.fillText(opts.empty || "Not enough data yet", w / 2, h / 2); return; }
-    const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
-    let x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
-    (opts.lines || []).forEach((l) => { if (l.y != null) { y0 = Math.min(y0, l.y); y1 = Math.max(y1, l.y); } });
-    if (y1 === y0) { y1 += Math.abs(y1) * 0.01 || 1; y0 -= Math.abs(y0) * 0.01 || 1; }
-    const pad = 6, X = (x) => pad + (x - x0) / (x1 - x0 || 1) * (w - 2 * pad), Y = (y) => h - pad - (y - y0) / (y1 - y0) * (h - 2 * pad);
-    (opts.lines || []).forEach((l) => { if (l.y == null) return; c.strokeStyle = l.color; c.setLineDash([4, 4]); c.lineWidth = 1; c.beginPath(); c.moveTo(pad, Y(l.y)); c.lineTo(w - pad, Y(l.y)); c.stroke(); c.setLineDash([]); });
-    const up = ys[ys.length - 1] >= ys[0];
-    c.strokeStyle = opts.color || (up ? "#2fd27a" : "#ff5d5d"); c.lineWidth = 2; c.beginPath();
-    pts.forEach((p, i) => (i ? c.lineTo(X(p[0]), Y(p[1])) : c.moveTo(X(p[0]), Y(p[1])))); c.stroke();
-    const g = c.createLinearGradient(0, 0, 0, h); g.addColorStop(0, (opts.color || (up ? "#2fd27a" : "#ff5d5d")) + "33"); g.addColorStop(1, "#0000");
-    c.lineTo(X(x1), h); c.lineTo(X(x0), h); c.closePath(); c.fillStyle = g; c.fill();
+  // persistent canvases so animations survive re-render
+  const homeCv = document.createElement("canvas");
+  const coinCv = document.createElement("canvas");
+
+  // ---- skeletons ----
+  const sk = (h, w, mt) => `<div class="sk" style="height:${h}px;${w ? "width:" + w + ";" : ""}margin:${mt || 0}px 16px 0"></div>`;
+  function skeleton(name) {
+    if (name === "home") return navbar(true) + sk(66, "70%", 8) + sk(20, "40%", 10) + sk(240, null, 16) + sk(44, null, 8) +
+      `<div class="sec-head"><span>Agents</span></div><div class="carousel"><div class="acard sk"></div></div>` + sk(60, null, 24) + sk(60, null, 1);
+    return `<div class="navbar"></div>` + sk(40, "50%", 8) + Array.from({ length: 6 }, (_, i) => sk(60, null, i ? 1 : 16)).join("");
   }
 
-  const empty = (ico, t, sub) => `<div class="empty"><div class="ico">${ico}</div><div><b>${esc(t)}</b></div><div class="small">${sub || ""}</div></div>`;
+  // ---- shared bits ----
+  const paperPill = st => st && st.mode === "PAPER" ? `<span class="pill paper">PAPER</span>` : "";
+  function unread() { const seen = +localStorage.getItem("desk.seen") || 0; return (S.state ? S.state.pushes : []).some(p => p.id > seen); }
+  function navbar() {
+    const st = S.state, h = st ? (st.account.fomo_handle || "?") : "";
+    return `<div class="navbar">
+      <a class="icon-btn" href="#/account" aria-label="Account"><span class="avatar">${esc(h.replace("@", "").slice(0, 1).toUpperCase())}</span></a>
+      <a class="title" href="#/agents">Grok Bot <span class="chev">›</span></a>
+      <button class="icon-btn" data-act="search" aria-label="Search"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></button>
+      <button class="icon-btn" data-act="bell" aria-label="Alerts"><svg viewBox="0 0 24 24"><path d="M6 16V11a6 6 0 0 1 12 0v5l2 2H4zM10 21h4"/></svg>${unread() ? '<i class="dot"></i>' : ""}</button>
+    </div>`;
+  }
+  const backbar = (title, extra) => `<div class="navbar"><a class="back" href="javascript:history.length>1?history.back():location.hash='#/'">‹ Back</a><span class="title" style="justify-content:center">${esc(title || "")}</span>${extra || '<span style="width:44px"></span>'}</div>`;
+  const agentById = id => S.state.agents.find(a => a.id === id);
+  const hasFile = mint => !!(S.state && S.state.search.find(c => c.mint === mint && c.has_file));
 
-  function activityItem(a) {
-    return `<div class="item"><div class="row"><div><span class="tag">${esc(a.agent)}</span> <b>${esc(a.title)}</b></div><span class="muted small">${isoT(a.ts)}</span></div>
-      ${a.line2 ? `<div class="small">${esc(a.line2)}</div>` : ""}${a.line3 ? `<div class="small muted">${esc(a.line3)}</div>` : ""}
-      ${a.link ? `<div style="margin-top:6px">${btn("Open on FOMO", a.link, "ghost")}</div>` : ""}</div>`;
+  // ---- activity row ----
+  function actRow(r) {
+    const ic = { bought: ["+", "#0a84ff"], sold: ["↑", "#00d35a"], stopped: ["↓", "#ff453a"], rejected: ["×", "rgba(235,235,245,0.3)"] }[r.kind] || ["•", "#fff"];
+    const v = String(r.value || "");
+    const vc = r.kind === "rejected" ? "ter" : r.kind === "stopped" || v.startsWith("-") ? "down" : r.kind === "sold" && v.startsWith("+") ? "up" : "";
+    const href = r.mint && hasFile(r.mint) ? `#/${r.screen}/${encodeURIComponent(r.mint)}` : null;
+    const inner = `<span class="ic" style="background:${ic[1]}22;color:${ic[1]}">${ic[0]}</span>
+      <span class="tx"><div class="t">${esc(r.title)}</div><div class="st">${esc(r.subtitle)}</div></span>
+      <span class="rv ${vc}">${esc(v)}</span>`;
+    return href ? `<a class="row" href="${href}">${inner}</a>` : `<div class="row">${inner}</div>`;
   }
 
-  function vHome() {
-    const s = D.state, open = D.positions.filter((p) => p.status === "open");
-    const today = D.positions.filter((p) => p.status === "closed" && Date.now() / 1000 - p.closed_at < 86400);
-    const pnl = today.reduce((a, p) => a + (p.pnl_usd || 0), 0);
-    const c = s.counts;
-    let h = `<div class="card"><div class="muted small">${s.mode === "PAPER" ? "Paper balance" : "Live stack"}</div>
-      <div class="row"><div class="big">${usd(s.stack)}</div><div class="${cls(s.stack - s.paper_start)}">${s.mode === "PAPER" ? pct(100 * (s.stack / s.paper_start - 1)) : ""}</div></div>
-      <div class="small muted">Cash ${usd(s.cash)} · 24h P&L <span class="${cls(pnl)}">${usd(pnl)}</span> · ticket ${usd(s.ticket)}</div>
-      <canvas id="eq"></canvas></div>`;
-    h += `<h2>Open positions</h2>`;
-    h += open.length ? open.map((p) => { const g = p.last_price ? 100 * (p.last_price / p.entry_price - 1) : null;
-      return `<div class="card"><a class="coin" href="#d=${encodeURIComponent(dataPath())}&c=${encodeURIComponent(p.mint)}"><div class="row"><b>${esc(p.name)}</b><b class="${cls(g)}">${pct(g)}</b></div>
-      <div class="small muted">${usd(p.size_usd)} at ${price(p.entry_price)} · stop ${price(p.stop_price)}${p.trail_active ? " (trailing)" : ""} · ${ago(p.opened_at)}</div></a>
-      <canvas data-series="${p.id}"></canvas><div style="margin-top:8px">${btn("Sell on FOMO", p.link, "sell")}</div></div>`; }).join("")
-      : `<div class="card">${empty("◎", "No open positions", "Executor buys only coins that pass Scanner, all 8 audit layers and the Analyst.")}</div>`;
-    h += `<h2>Tonight</h2><div class="card grid"><div><b>${c.migrations}</b><span class="small muted">graduates</span></div><div><b>${c.scanned_pass}</b><span class="small muted">scanned</span></div><div><b>${c.audit_pass}/${c.audited}</b><span class="small muted">audit pass</span></div><div><b>${c.bought}</b><span class="small muted">bought</span></div></div>`;
-    h += `<h2>Activity</h2><div class="card feed">${D.activity.length ? D.activity.slice(0, 40).map(activityItem).join("") : empty("…", "No activity yet", "Waiting for the first pump.fun graduate.")}</div>`;
-    $("#view").innerHTML = h;
-    chart($("#eq"), [[s.generated_at - 86400 * 7, s.paper_start]].concat(s.equity || []).concat([[s.generated_at, s.stack]]), { h: 90, empty: "Equity curve starts with the first closed trade" });
-    open.forEach((p) => { const cv = document.querySelector(`canvas[data-series="${p.id}"]`); if (cv) chart(cv, p.series, { h: 80, lines: [{ y: p.entry_price, color: "#8b93a7" }, { y: p.stop_price, color: "#ff5d5d" }] }); });
+  // ---- agent card (home carousel) ----
+  function card(a) {
+    const c = a.card || {};
+    const head = `<h3 style="color:${a.color}"><span class="sdot ${a.status}"></span>${esc(a.name)}</h3>`;
+    let body = "";
+    if (a.id === "scanner") {
+      const feed = (c.feed || []).slice(0, 4).map(d => d.verdict === "pass"
+        ? `<div class="p">${esc(d.coin)} <span class="sec">→ auditor</span></div>`
+        : `<div class="k">${esc(d.coin)}<small>${esc(d.reason)}</small></div>`).join("");
+      body = `<div class="meta">${a.count} pools · ${c.waiting} in waiting room</div>
+        <div class="feed">${feed || '<div class="sec">Listening for graduations</div>'}</div>
+        <div class="big" style="color:${a.color}">${a.count} <span class="sec" style="font-size:20px">pools</span></div>`;
+    } else if (a.id === "auditor") {
+      const s = c.strips || [], last = c.last;
+      const strips = Array.from({ length: 8 }, (_, i) => `<i class="${s[i] === true ? "ok" : s[i] === false ? "no" : ""}"></i>`).join("");
+      const line = c.busy ? `taking apart ${esc(c.busy.coin)}…` : last ? (last.pass ? `${esc(last.coin)} · 8/8 → Executor` : `${esc(last.coin)} · ${esc(last.reason)}`) : "No coin taken apart yet";
+      body = `<div class="meta">${a.count} taken apart</div><div class="strips">${strips}</div>
+        <div class="feed"><div class="${last && !last.pass && !c.busy ? "down" : ""}">${line}</div></div>
+        <div class="big">${a.count} <span class="sec" style="font-size:20px">taken apart</span></div>
+        <div class="foot">${a.rejected} rejected</div>`;
+    } else if (a.id === "analyst") {
+      const l = c.last;
+      body = `<div class="meta">Scoring · ${esc(c.mode)} · min ${c.min_score}</div>
+        <canvas class="ring" data-ring="${l ? l.score : ""}" data-min="${c.min_score}"></canvas>
+        <div class="feed">${l ? `<div>${esc(l.coin)} · <span class="${l.verdict === "pass" ? "up" : "down"}">${l.verdict === "pass" ? "pass" : "reject"}</span></div><div class="sec">${esc(l.reason)}</div>` : '<div class="sec">Nothing scored yet</div>'}</div>
+        <div class="big" style="color:${a.color}">${a.count} <span class="sec" style="font-size:20px">scored</span></div>`;
+    } else if (a.id === "executor") {
+      const l = c.last;
+      const bar = c.busy ? `<div class="bar"><i style="width:100%;opacity:.5"></i></div><div class="foot">Executing… ${esc(c.busy.coin)}</div>`
+        : l ? `<div class="bar"><i style="width:100%"></i></div><div class="foot up">✓ ${l.status === "filled" ? "Filled" : "Sent to Telegram"}</div>` : "";
+      body = `<div class="meta">${a.count} trades</div>
+        <div class="feed">${l ? `<div>${esc(l.coin)}</div><div class="sec">${usd(l.size_usd)} · ${l.stack_pct}% of stack</div>` : '<div class="sec">No trades yet</div>'}</div>${bar}
+        <div class="big" style="color:${a.color}">${a.count} <span class="sec" style="font-size:20px">trades</span></div>`;
+    } else {
+      const l = c.last;
+      body = `<div class="meta">Guarding · ${c.open} open</div>
+        <div class="feed">${l ? `<div>${esc(l.text)} · ${esc(l.coin)}</div>` : '<div class="sec">Nothing to guard yet</div>'}</div>
+        <div class="big" style="color:${a.color}">${c.open} <span class="sec" style="font-size:20px">open</span></div>
+        <div class="foot"><span class="pill mono red">stop -${c.stop_pct}%</span><span class="pill mono green">trail ${c.trail_pct}%</span></div>`;
+    }
+    return `<a class="acard" href="#/agents?a=${a.id}">${head}${body}</a>`;
   }
 
-  function hbClass(a, gen) {
-    if (a.paused) return "warn";
-    if (!a.beat) return "bad";
-    const age = gen - a.beat;
-    if (a.status && a.status.startsWith("error")) return "warn";
-    return age < 300 ? "ok" : age < 900 ? "warn" : "bad";
+  // ---- screens ----
+  function home() {
+    const st = S.state, ch = S.chart;
+    setOdo(usd(st.balance));
+    const pts = (ch.ranges[S.range] || []);
+    const trades = ch.marks.length > 0;
+    const val = ts => { let best = null; for (const p of pts) { if (p[0] <= ts) best = p[1]; } return best == null ? (pts[0] || [0, st.balance])[1] : best; };
+    const colors = { bought: "#0a84ff", sold: "#00d35a", stopped: "#ff453a" };
+    const marks = ch.marks.map((m, i) => ({ ts: m.ts, value: val(m.ts), text: m.label, color: colors[m.kind], key: m.kind + m.mint + m.ts }));
+    const acts = (S.act.rows || []).slice(0, 5);
+    const html = navbar() + `
+      <section class="balance">
+        <div class="bal-row"><span id="odo-slot"></span>${paperPill(st)}</div>
+        <div class="today"><span class="${st.today_pct >= 0 ? "up" : "down"}">${pct(st.today_pct)}</span><span class="sec">today</span>
+          <span class="pill mult">${st.multiplier.toFixed(2)}×</span></div>
+      </section>
+      <div class="chart-wrap"><span id="cv-slot"></span>${trades ? "" : '<div class="chart-empty">Waiting for the first trade</div>'}</div>
+      <div class="ranges">${["LIVE", "1H", "4H", "1D", "1W", "ALL"].map(r => `<button data-range="${r}" class="${r === S.range ? "on" : ""}">${r}</button>`).join("")}</div>
+      <div class="sec-head"><span>Agents <span class="sub">· ${st.running} running</span></span></div>
+      <div class="carousel" id="car">${st.agents.map(card).join("")}</div>
+      <div class="sec-head"><span>Activity</span><a href="#/activity">See all</a></div>
+      ${acts.length ? `<div class="list">${acts.map(actRow).join("")}</div>` : '<div class="empty">Nothing yet tonight</div>'}`;
+    return { html, after() {
+      $("#odo-slot").replaceWith(odo); $("#cv-slot").replaceWith(homeCv);
+      homeCv.style.height = "240px";
+      Charts.line(homeCv, { points: trades ? pts : [], start: ch.start_value, marks: trades ? marks : [], empty: true });
+    } };
   }
 
-  function vAgents() {
-    const s = D.state, c = s.counts, gen = s.generated_at;
-    const desc = { scanner: `Room ${c.room} · passed ${c.scanned_pass} of ${c.migrations} tonight`, auditor: `Audited ${c.audited} · passed ${c.audit_pass}`,
-      analyst: `${s.settings["analyst.mode"]} · analyzed ${c.analyzed} · passed ${c.analyst_pass} · Jev calls ${s.totals.jev_calls}`,
-      executor: `Ticket ${usd(s.ticket)} · bought ${c.bought}`, risk: `Stop -${s.settings["risk.stop_pct"]}% · trail ${s.settings["risk.trail_pct"]}% from +${s.settings["risk.trail_start_pct"]}% · timeout ${s.settings["risk.timeout_h"]}h` };
-    let h = s.agents.map((a) => `<div class="card"><div class="row"><div><span class="dot ${hbClass(a, gen)}"></span><b>${a.name}</b></div><span class="small muted">${a.paused ? "paused" : esc(a.status || "no heartbeat")}</span></div>
-      <div class="small">${esc(desc[a.id])}</div><div class="small muted">Heartbeat ${a.beat ? Math.round(gen - a.beat) + "s before publish" : "never"}</div>
-      <div class="feed small" style="margin-top:6px">${D.activity.filter((x) => x.agent === a.id).slice(0, 3).map((x) => `<div class="item">${esc(x.title)}<div class="muted">${esc(x.line2 || "")}</div></div>`).join("") || '<div class="muted">No activity yet</div>'}</div></div>`).join("");
-    h += `<div class="card small muted">PumpPortal stream: last message ${ago(s.ws.last_msg)} · reconnects 24h ${s.ws.reconnects_24h}. Pause or resume agents in Telegram: <b>pause scanner</b>.</div>`;
-    $("#view").innerHTML = h;
+  function agents(q) {
+    const st = S.state;
+    const html = `<div class="navbar"><span class="title">Agents</span></div><div class="large-title">Agents</div>` +
+      st.agents.map(a => {
+        const alias = a.id;
+        const dec = (a.decisions || []).map(d => `<div class="dec"><span class="tm">${hm(d.ts)}</span>
+          <span>${ext(d.coin_url, esc(d.coin))} · <b class="${/pass|filled|8\/8|sold/.test(d.verdict) ? "up" : /reject|stopped|skipped|\d\/8/.test(d.verdict) ? "down" : ""}">${esc(d.verdict)}</b></span>
+          <span class="why">${esc(d.reason || "")}</span></div>`).join("");
+        return `<section class="afull" id="ag-${a.id}">
+          <div class="hd"><h3 style="color:${a.color}">${esc(a.name)} <span class="sdot ${a.status}"></span></h3>
+            <span class="sec">${a.count} ${esc(a.count_label)} today</span>
+            <span class="switch ${a.paused ? "off" : ""}" role="switch" aria-checked="${!a.paused}" aria-disabled="true"></span></div>
+          <div class="cmd">${a.status} · to ${a.paused ? "resume" : "pause"}, send “${esc(a.command)}” in Telegram</div>
+          <div style="margin-top:10px">${dec || `<div class="sec" style="padding:8px 0">${a.id === "scanner" ? "Listening for graduations" : a.id === "auditor" ? "No coin taken apart yet" : "Nothing yet tonight"}</div>`}</div>
+          <a class="link-btn" href="#/account?g=${alias}">Settings ›</a></section>`;
+      }).join("");
+    return { html, after() { const a = q && q.get("a"); if (a) { const el = $("#ag-" + a); if (el) el.scrollIntoView(); } } };
   }
 
-  function layerBar(a) { return a && a.layers ? `<div class="layers">${a.layers.map((l) => `<span class="${l.ok ? "ok" : ""}" title="${esc(l.layer)}"></span>`).join("")}</div>` : ""; }
-
-  function vAuditor() {
-    const list = D.coins.filter((c) => c.audit);
-    $("#view").innerHTML = list.length ? list.map((c) => { const n = c.audit.layers.filter((l) => l.ok).length;
-      return `<div class="card"><a class="coin" href="#d=${encodeURIComponent(dataPath())}&c=${encodeURIComponent(c.mint)}"><div class="row"><b>${esc(c.label)}</b><b class="${n === 8 ? "g" : "r"}">${n}/8</b></div>
-      <div class="small muted">${c.audit.passed ? "Passed all 8 layers" : esc(c.audit.reason)} · ${isoT(c.audit.ts)}</div>${layerBar(c.audit)}</a></div>`; }).join("")
-      : `<div class="card">${empty("🛡", "No audits yet", "A coin reaches the Auditor after Scanner sees enough liquidity, pool age and a low top-10 share.")}</div>`;
+  function activity() {
+    const rows = S.act.rows || [];
+    const html = `<div class="navbar"><span class="title">Activity</span></div><div class="large-title">Activity</div>` +
+      (rows.length ? `<div class="list">${rows.slice(0, S.actShown).map(actRow).join("")}</div>` +
+        (rows.length > S.actShown ? `<button class="more" data-act="more">Show ${Math.min(S.act.page_size, rows.length - S.actShown)} more</button>` : "")
+        : '<div class="empty">Nothing yet tonight</div>');
+    return { html };
   }
 
-  function vCoin(mint) {
-    const c = D.coins.find((x) => x.mint === mint), p = D.positions.find((x) => x.mint === mint);
-    if (!c && !p) { $("#view").innerHTML = `<a class="back" href="#d=${encodeURIComponent(dataPath())}">‹ Back</a><div class="card">${empty("?", "Coin not in the published data", "Only the latest 150 coins are published.")}</div>`; return; }
-    const name = c ? c.label : p.name, link = (c || p).link;
-    let h = `<a class="back" href="#d=${encodeURIComponent(dataPath())}">‹ Back</a><div class="card"><div class="row"><div><b style="font-size:20px">${esc(name)}</b><div class="small muted" style="word-break:break-all">${esc(mint)}</div></div></div>
-      ${c ? `<div class="small" style="margin-top:6px">Status <b>${esc(c.status)}</b>${c.reason ? ` · ${esc(c.reason)}` : ""}</div>
-      <div class="small muted">Liq ${usd(c.liq)} · top10 ${c.top10 != null ? c.top10.toFixed(1) + "%" : "n/a"} · h1 ${pct(c.h1)} · holders ${c.holders ?? "n/a"} · graduated ${ago(c.migrated_at)}</div>` : ""}
-      <canvas id="cc"></canvas><div class="row" style="margin-top:10px">${btn(p && p.status === "open" ? "Sell on FOMO" : "Buy on FOMO", link, p && p.status === "open" ? "sell" : "")}</div></div>`;
-    if (p) { const g = p.status === "open" ? (p.last_price ? 100 * (p.last_price / p.entry_price - 1) : null) : p.pct;
-      h += `<h2>Position (${esc(p.mode)})</h2><div class="card"><div class="row"><span>${usd(p.size_usd)} at ${price(p.entry_price)}</span><b class="${cls(g)}">${pct(g)}</b></div>
-      <div class="small muted">${p.status === "open" ? `Stop ${price(p.stop_price)}${p.trail_active ? " (trailing)" : ""} · peak ${price(p.peak)}` : `Closed ${esc(p.exit_reason)} at ${price(p.exit_price)} · ${usd(p.pnl_usd)} after fees ${usd(p.fees_usd)}`}</div></div>`; }
-    if (c && c.audit) h += `<h2>Audit ${c.audit.layers.filter((l) => l.ok).length}/8</h2><div class="card">${c.audit.layers.map((l) => `<div class="lrow"><span class="${l.ok ? "g" : "r"}">${l.ok ? "✓" : "✕"}</span><span>${l.n}. ${esc(l.layer)}</span><span class="v">${esc(l.value)}<div class="small muted">${esc(l.rule)}</div></span></div>`).join("")}</div>`;
-    if (c && c.analysis) { const a = c.analysis;
-      h += `<h2>Analyst (${esc(a.mode)})</h2><div class="card">${Object.entries(a.answers || {}).map(([k, v]) => `<div class="set"><span>${esc(k)}</span><span>${v == null ? "n/a" : Number(v).toFixed(2)}</span></div>`).join("")}
-      ${a.score != null ? `<div class="set"><span>score</span><span>${a.score}</span></div>` : ""}<div class="small ${a.passed ? "g" : "r"}" style="margin-top:6px">${a.passed ? "Passed" : esc((a.failed || []).join("; "))}</div>${a.note ? `<div class="small muted">${esc(a.note)}</div>` : ""}</div>`; }
-    $("#view").innerHTML = h;
-    const series = (p && p.series && p.series.length ? p.series : c ? c.series : []) || [];
-    chart($("#cc"), series, { h: 140, lines: p ? [{ y: p.entry_price, color: "#8b93a7" }] : [] });
+  function account(q) {
+    const st = S.state, a = st.account;
+    const groups = st.settings.map(g => `<div class="group-h" id="set-${g.agent}">${g.agent[0].toUpperCase() + g.agent.slice(1)}</div>
+      <div class="list set">${g.items.map(i => `<div class="row"><span class="tx"><div class="t">${esc(i.name)}<small>${esc(i.aliases.length ? "set " + i.aliases[0] + " to …" : i.key)}</small></div></span><span class="rv">${esc(i.value)}</span></div>`).join("")}</div>`).join("");
+    const html = `<div class="navbar"><span class="title">Account</span></div><div class="large-title">Account</div>
+      <div class="list">
+        <div class="row"><span class="tx"><div class="t">Mode</div><div class="st">Send “${a.mode === "PAPER" ? "live" : "paper"}” in Telegram to switch</div></span>${a.mode === "PAPER" ? '<span class="pill paper">PAPER</span>' : '<span class="pill green">LIVE</span>'}</div>
+        <div class="row"><span class="tx"><div class="t">Stack</div><div class="st">${a.mode === "LIVE" ? "LIVE stack" : "Paper cash + open positions at entry"}</div></span><span class="rv">${usd(a.stack)}</span></div>
+        <a class="row" href="${esc(a.profile_url)}" target="_blank" rel="noopener"><span class="tx"><div class="t">Your FOMO profile</div><div class="st">@${esc(String(a.fomo_handle || "").replace(/^@/, ""))}</div></span><span class="chev">›</span></a>
+        <button class="row" style="width:100%;text-align:left" data-act="invite" data-url="${esc(a.signup_url)}"><span class="tx"><div class="t">Invite a friend</div><div class="st">Share your FOMO invite link</div></span><span class="chev">›</span></button>
+        <div class="row"><span class="tx"><div class="t">Telegram</div></span><span class="rv ${a.telegram ? "up" : "down"}">${a.telegram ? "Connected" : "Not connected"}</span></div>
+        <div class="row"><span class="tx"><div class="t">Web push</div><div class="st">${esc(a.webpush)}</div></span></div>
+      </div>
+      <div class="group-h">Settings are read-only here. Change them in Telegram, e.g. “set stop to -8%”. Live min stack ${usd(a.min_stack)}.</div>
+      ${groups}`;
+    return { html, after() { const g = q && q.get("g"); if (g) { const el = $("#set-" + g); if (el) el.scrollIntoView(); } } };
   }
 
-  function vAccount() {
-    const s = D.state, st = s.settings;
-    const groups = {};
-    Object.keys(st).sort().forEach((k) => { const g = k.split(".")[0]; (groups[g] = groups[g] || []).push(k); });
-    let h = `<div class="card"><div class="row"><span>Mode</span><b>${esc(s.mode)}</b></div><div class="row"><span>Stack</span><b>${usd(s.stack)}</b></div>
-      <div class="row"><span>Ticket</span><b>${usd(s.ticket)}</b></div><div class="row"><span>Stack for ${st["executor.stack_pct"]}% without bump</span><b>${usd(s.min_stack)}</b></div>
-      <div class="row"><span>FOMO</span><b>${esc(st["desk.fomo_handle"])}</b></div>
-      <div class="row" style="margin-top:10px;gap:8px;justify-content:flex-start">${btn("My FOMO profile", s.links.profile, "ghost")}${btn("Invite friends", s.links.invite, "ghost")}</div></div>
-      <div class="card small muted">Read-only here. Change any setting in Telegram, e.g. <b>set stop to -8%</b>, <b>pause scanner</b>, <b>paper</b> / <b>live</b>. The app refreshes every ~1-2 min (published every ${s.publish.push_min_s}s at most).</div>`;
-    for (const g of Object.keys(groups)) h += `<h2>${esc(g)}</h2><div class="card">${groups[g].filter((k) => k !== "desk.rpc_url").map((k) => `<div class="set"><span>${esc(k.split(".")[1])}</span><span>${esc(typeof st[k] === "boolean" ? (st[k] ? "on" : "off") : st[k])}</span></div>`).join("")}</div>`;
-    h += `<div class="card small muted">Jev usage: ${s.totals.jev_calls} calls · ${s.totals.jev_tokens_in} in / ${s.totals.jev_tokens_out} out tokens.</div>`;
-    $("#view").innerHTML = h;
+  const played = new Set();
+  function auditor(mint) {
+    const c = S.coins[mint];
+    if (!c || c._missing) return { html: backbar("Auditor") + (c && c._missing ? '<div class="empty">No coin taken apart yet</div>' : skeleton("x")) };
+    const au = c.audit;
+    const names = au ? au.layers.map(l => l.name) : Array.from({ length: 8 }, (_, i) => "Layer " + (i + 1));
+    const key = au ? mint + au.ts : null;
+    const play = au && !played.has(key) && !RM();
+    const discs = names.map((n, i) => {
+      const l = au && au.layers[i];
+      const cls = l && !play ? (l.pass ? "ok" : "no") : "";
+      return `<div class="disc ${cls}" data-i="${i}"><span>${i + 1} · ${esc(n)}</span><span class="mk">${l && !play ? (l.pass ? "✓" : "✕") : ""}</span></div>`;
+    }).join("");
+    let verdict;
+    if (!au) verdict = c.status === "scanned" ? `<h2>Taking apart…</h2><p>Waiting for the Auditor</p>` : `<h2 class="sec">No coin taken apart yet</h2>`;
+    else if (au.passed) verdict = `<h2 class="up">Cleared · 8/8 parts</h2><p>${c.signal ? `Sent to Executor · ${usd(c.signal.size_usd)}` : c.status === "rejected" ? `Then stopped by ${esc(c.stopped_by)} · ${esc(c.reason)}` : "Sent to Executor"}</p>`;
+    else verdict = `<h2 class="down">Rejected · ${esc(au.reason)}</h2><p>Grok Bot won't buy ${esc(c.label)}</p>`;
+    const rows = au ? au.layers.map(l => `<div class="row vrow"><span class="ic" style="background:${l.pass ? "#00d35a22" : "#ff453a22"};color:${l.pass ? "#00d35a" : "#ff453a"}">${l.pass ? "✓" : "✕"}</span>
+        <span class="tx"><div class="t">${l.n} · ${esc(l.name)}</div><div class="st">${esc(l.rule ? "rule " + l.rule : "")}${l.source ? " · " + esc(l.source) : ""}</div></span><span class="rv">${esc(l.value)}</span></div>`).join("") : "";
+    const alias = (S.state.settings.find(g => g.agent === "auditor").items.find(i => i.key === "auditor.enabled") || {}).aliases || [];
+    const html = backbar(c.label) + `<div class="discs" id="discs">${discs}</div><div class="verdict">${verdict}</div>
+      ${rows ? `<div class="list">${rows}</div>` : ""}
+      <div class="list" style="margin-top:16px"><div class="row"><span class="tx"><div class="t">Take apart before buying</div><div class="st">Send “set ${esc(alias[0] || "auditor.enabled")} to ${S.state.audit_enabled ? "off" : "on"}” in Telegram</div></span><span class="switch ${S.state.audit_enabled ? "" : "off"}" aria-disabled="true"></span></div></div>
+      <a class="cta" href="${esc(c.coin_url)}" target="_blank" rel="noopener">Open on FOMO</a>`;
+    return { html, after() {
+      const ds = [...document.querySelectorAll("#discs .disc")];
+      if (!au && c.status === "scanned" && !RM()) {   // waiting on the server: beam only, no colours
+        let i = 0; const t = setInterval(() => { if (!document.body.contains(ds[0])) return clearInterval(t);
+          ds.forEach(d => d.classList.remove("beam")); void ds[i].offsetWidth; ds[i].classList.add("beam"); i = (i + 1) % 8; }, 350);
+      }
+      if (play) {
+        played.add(key);
+        au.layers.forEach((l, i) => {
+          setTimeout(() => ds[i].classList.add("beam"), i * 350);
+          setTimeout(() => { ds[i].classList.remove("beam"); ds[i].classList.add(l.pass ? "ok" : "no"); ds[i].querySelector(".mk").textContent = l.pass ? "✓" : "✕"; }, i * 350 + 350);
+        });
+      }
+    } };
   }
 
+  function coin(mint) {
+    const c = S.coins[mint];
+    if (!c || c._missing) return { html: backbar("Coin") + (c && c._missing ? '<div class="empty">This coin isn’t on the desk.</div>' : skeleton("x")) };
+    const p = c.position, ex = c.exit, au = c.audit, st = c.stats || {};
+    const shield = au ? `<a class="chip ${au.passed ? "" : "no"}" href="#/auditor/${encodeURIComponent(mint)}">🛡 ${au.passed_count}/8</a>` : "";
+    const since = p ? `<div class="today" style="padding:0 16px"><span class="${p.change_pct >= 0 ? "up" : "down"}">${p.change_pct >= 0 ? "▲" : "▼"} ${Math.abs(p.change_pct).toFixed(2)}%</span><span class="sec">since entry</span></div>` : "";
+    const statusLine = !p && c.status === "rejected" ? `<div class="today" style="padding:0 16px"><span class="down">Stopped by ${esc(c.stopped_by)}</span><span class="sec">${esc(c.reason)}</span></div>` : "";
+    const posCard = p ? `<div class="card"><h3>Your position · ${usd(p.size_usd)} in · Executor</h3>
+        <div class="kv"><span>Entry</span><span>${price(p.entry_price)} · ${hm(p.opened_at)}</span></div>
+        ${p.open ? "" : `<div class="kv"><span>Exit</span><span>${price(p.exit_price)} · ${esc(p.exit_reason)}</span></div><div class="kv"><span>P&amp;L</span><span class="${p.pnl_usd >= 0 ? "up" : "down"}">${(p.pnl_usd >= 0 ? "+" : "") + usd(p.pnl_usd)}</span></div>`}</div>` : "";
+    const exitCard = ex ? `<div class="card"><h3>Exit · Risk</h3>
+        <div class="kv"><span>Stop line</span><span><span class="pill mono red">stop -${ex.stop_pct}%</span> ${price(ex.stop_line)}</span></div>
+        <div class="kv"><span>Trail line</span><span><span class="pill mono green">trail ${ex.trail_pct}%</span> ${ex.trail_active ? price(ex.trail_line) : "starts at " + price(ex.trail_start_line)}</span></div>
+        <div class="kv"><span>Timeout</span><span>${left(ex.timeout_at)} left</span></div></div>` : "";
+    const html = backbar(c.symbol || "", paperPill(S.state) || '<span style="width:44px"></span>') + `
+      <div class="coin-head"><h1>${esc(c.name || c.mint.slice(0, 6))} ${shield}</h1>
+        <div class="sec">${esc(c.symbol || "")} · ${esc(c.chain)} · ${age(c.migrated_at)}</div></div>
+      <div class="price ${c.price != null && c.price < 0.001 ? "small" : ""}">${price(c.price)}</div>${since}${statusLine}
+      <div class="chart-wrap"><span id="cv-slot"></span>${(c.candles || []).length ? "" : '<div class="chart-empty">No price yet</div>'}</div>
+      <div class="stats"><div><b>${usdK(st.market_cap)}</b><span>Market cap</span></div><div><b>${usdK(st.liquidity)}</b><span>Liquidity</span></div>
+        <div><b>${usdK(st.volume_24h)}</b><span>24h volume</span></div><div><b>${st.holders == null ? "n/a" : st.holders.toLocaleString("en-US")}</b><span>Holders</span></div></div>
+      ${posCard}${exitCard}
+      <a class="cta ${p && p.open ? "sell" : ""}" href="${esc(c.coin_url)}" target="_blank" rel="noopener">${p && p.open ? "Sell on FOMO" : "Buy on FOMO"}</a>`;
+    return { html, after() {
+      $("#cv-slot").replaceWith(coinCv); coinCv.style.height = "260px";
+      Charts.candles(coinCv, { candles: c.candles, lines: ex ? [{ value: ex.exit_line, color: "#ff9f0a", label: "Risk trailing stop" }] : [] });
+    } };
+  }
+
+  // ---- overlays ----
+  function sheet() {
+    const el = $("#sheet");
+    if (!S.sheet || !S.state) { el.hidden = true; return; }
+    el.hidden = false;
+    if (S.sheet === "bell") {
+      const ps = S.state.pushes;
+      el.innerHTML = `<div class="navbar"><span class="title">Alerts</span><button class="back" data-act="close">Done</button></div>` +
+        (ps.length ? `<div class="list">${ps.map(p => `<div class="row"><span class="tx"><div class="t">${esc(p.title)}</div><div class="st">${hm(p.ts)} · ${esc(p.kind)}</div></span>${p.coin_url ? ext(p.coin_url, '<span class="chev">›</span>') : ""}</div>`).join("")}</div>` : '<div class="empty">Nothing yet tonight</div>');
+      localStorage.setItem("desk.seen", Math.max(0, ...ps.map(p => p.id)));
+    } else {
+      if (!el.querySelector(".search-in")) {
+        el.innerHTML = `<div class="navbar"><input class="search-in" placeholder="Name, symbol or mint" autocomplete="off" autocapitalize="off"><button class="back" data-act="close">Cancel</button></div><div id="res"></div>`;
+        const inp = el.querySelector(".search-in"); inp.value = S.q; inp.focus();
+        inp.addEventListener("input", () => { S.q = inp.value; results(); });
+      }
+      results();
+    }
+  }
+  function results() {
+    const q = S.q.trim().toLowerCase(), box = $("#res");
+    if (!box) return;
+    const hits = q ? S.state.search.filter(c => [c.name, c.symbol, c.mint].some(v => v && v.toLowerCase().includes(q))).slice(0, 40) : [];
+    box.innerHTML = hits.length ? `<div class="list">${hits.map(c => {
+      const t = `<span class="tx"><div class="t">${esc(c.name || c.mint.slice(0, 8))}</div><div class="st">${esc(c.symbol || "")} · ${esc(c.mint.slice(0, 6))}…</div></span><span class="chev">›</span>`;
+      return c.has_file ? `<a class="row" href="#/coin/${encodeURIComponent(c.mint)}">${t}</a>` : `<a class="row" href="${esc(c.coin_url)}" target="_blank" rel="noopener">${t}</a>`;
+    }).join("")}</div>` : (q ? '<div class="empty">No coin matches</div>' : "");
+  }
+
+  // ---- render ----
   function render() {
-    const p = params();
-    if (p.c) tab = "coin"; else if (p.t) tab = p.t; else if (tab === "coin") tab = "home";
-    document.querySelectorAll("#tabs a").forEach((a) => a.classList.toggle("on", a.dataset.tab === tab));
+    const r = route(), v = $("#view");
+    document.querySelectorAll(".tabbar a").forEach(a => a.classList.toggle("on", a.dataset.tab === (["coin", "auditor"].includes(r.name) ? "" : r.name)));
     banner();
-    const m = $("#mode");
-    if (lastErr === "nopath") { m.textContent = "—"; $("#view").innerHTML = `<div class="card">${empty("🔑", "Open your private desk link", "This app needs the link that ends in <b>#d=…</b>. Open it once and it is remembered on this device.")}</div>`; return; }
-    if (!D.state) { m.textContent = "…"; $("#view").innerHTML = lastErr ? `<div class="card">${empty("⚠", "Desk data unavailable", "Nothing published yet at this link, or the network is down. Retrying every minute.")}</div>` : `<div class="card">${empty("…", "Loading", "")}</div>`; return; }
-    m.textContent = D.state.mode; m.className = "badge" + (D.state.mode === "LIVE" ? " live" : "");
-    $("#updated").textContent = "Updated " + ago(D.state.generated_at);
-    ({ home: vHome, agents: vAgents, auditor: vAuditor, account: vAccount, coin: () => vCoin(p.c) }[tab] || vHome)();
+    if (!DP) { v.innerHTML = `<div class="navbar"><span class="title">Desk</span></div><div class="empty">Open the desk link from Telegram once (it ends in #d=…). It is kept on this phone after that.</div>`; return; }
+    if (!S.state) { v.innerHTML = skeleton(r.name); return; }
+    const car = $("#car"), sl = car ? car.scrollLeft : 0, y = window.scrollY;
+    const scr = r.name === "home" ? home() : r.name === "agents" ? agents(r.q) : r.name === "activity" ? activity()
+      : r.name === "account" ? account(r.q) : r.name === "coin" ? coin(r.mint) : r.name === "auditor" ? auditor(r.mint) : home();
+    v.innerHTML = scr.html;
+    if (scr.after) scr.after();
+    document.querySelectorAll("canvas[data-ring]").forEach(cv => Charts.ring(cv, cv.dataset.ring === "" ? null : +cv.dataset.ring, +cv.dataset.min));
+    const car2 = $("#car"); if (car2) car2.scrollLeft = sl;
+    if (!(r.q && (r.q.get("a") || r.q.get("g")))) window.scrollTo(0, y);
+    sheet();
   }
 
-  document.querySelectorAll("#tabs a").forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); tab = a.dataset.tab; setHash(tab === "home" ? "" : "t=" + tab); window.scrollTo(0, 0); }));
-  window.addEventListener("hashchange", render);
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
-  setInterval(load, POLL_MS);
-  setInterval(() => { if (D.state) $("#updated").textContent = "Updated " + ago(D.state.generated_at); }, 15000);
-  load();
+  document.addEventListener("click", async e => {
+    const b = e.target.closest("[data-act],[data-range]");
+    if (!b) return;
+    if (b.dataset.range) { S.range = b.dataset.range; return render(); }
+    const act = b.dataset.act;
+    if (act === "search" || act === "bell") { S.sheet = act; S.q = ""; $("#sheet").innerHTML = ""; return render(); }
+    if (act === "close") { S.sheet = null; $("#sheet").innerHTML = ""; return render(); }
+    if (act === "more") { S.actShown += S.act.page_size; return render(); }
+    if (act === "invite") {
+      const url = b.dataset.url;
+      try { if (navigator.share) { await navigator.share({ title: "FOMO", url }); return; } } catch (err) { if (err && err.name === "AbortError") return; }
+      try { await navigator.clipboard.writeText(url); } catch (err) {
+        const t = document.createElement("textarea"); t.value = url; document.body.appendChild(t); t.select(); document.execCommand("copy"); t.remove();
+      }
+      const ts = $("#toast"); ts.textContent = "Link copied"; ts.hidden = false; setTimeout(() => ts.hidden = true, 1600);
+    }
+  });
+  addEventListener("resize", () => render());
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+  render(); poll();
 })();
